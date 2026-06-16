@@ -1,0 +1,30 @@
+==========================================================
+  Hierarchical Time Wheel - Statistics Report
+==========================================================
+
+  ┌──────────────────────────────────────────────┐
+  │ Metric                          │ Value                    │
+  ├──────────────────────────────────────────────┤
+  │ Total scheduled                │ 5,000                    │
+  │ Total executed                 │ 5,000                    │
+  │ Total cancelled             │ 1,000                    │
+  │ Cancel attempts           │ 1,000                    │
+  │ Cancel hit rate           │ 100.00               %  │
+  │ Periodic tasks scheduled  │ 0                        │
+  │ Periodic fires total      │ 0                        │
+  ├──────────────────────────────────────────────┤
+  │ Tick count                    │ 870                      │
+  │ Ticks/sec (instant)     │ 0                        │
+  │ Ready queue peak          │ 14                       │
+  └──────────────────────────────────────────────┘
+
+  Delay distribution (microseconds):
+    <=        0 us :     3628
+    <=       10 us :       33
+    <=       50 us :       93
+    <=      100 us :       68
+    <=      250 us :       95
+    <=      500 us :       39
+    <=     1000 us :       11
+    p50=0 us,  p99=500 us
+==========================================================

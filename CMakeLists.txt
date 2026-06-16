@@ -19,3 +19,8 @@ target_link_libraries(example PRIVATE time_wheel)
 
 add_executable(stress_test stress_test.cpp)
 target_link_libraries(stress_test PRIVATE time_wheel)
+
+if(MINGW)
+    target_link_options(example PRIVATE -static -static-libgcc -static-libstdc++)
+    target_link_options(stress_test PRIVATE -static -static-libgcc -static-libstdc++)
+endif()

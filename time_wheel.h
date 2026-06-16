@@ -7,38 +7,56 @@
 #include <memory>
 #include <mutex>
 #include <thread>
-#include <unordered_map>
 #include <vector>
-#include <condition_variable>
+#include <string>
+#include <sstream>
+#include <unordered_map>
 
 namespace htw {
 
 using TaskId = uint64_t;
+using GroupId = uint64_t;
 using Clock = std::chrono::steady_clock;
 using TimePoint = Clock::time_point;
 using Millis = std::chrono::milliseconds;
+using Micros = std::chrono::microseconds;
 using Callback = std::function<void()>;
 
 constexpr TaskId kInvalidTaskId = 0;
+constexpr GroupId kDefaultGroup = 0;
+
+enum class TaskState {
+    Pending,
+    Ready,
+    Executing,
+    Done,
+    Cancelled
+};
 
 struct TaskNode {
     TaskId id{0};
+    GroupId group{kDefaultGroup};
     Callback cb;
     TimePoint expire;
+    Millis repeat_ms{0};
     TaskNode* next{nullptr};
     TaskNode* hash_next{nullptr};
+    TaskNode* group_next{nullptr};
+    TaskNode* group_prev{nullptr};
     std::atomic<bool> cancelled{false};
     std::atomic<bool> executed{false};
+    bool is_periodic{false};
 };
 
-class LockFreeQueue {
+class ThreadSafeQueue {
 public:
-    LockFreeQueue() = default;
-    ~LockFreeQueue();
+    ThreadSafeQueue() = default;
+    ~ThreadSafeQueue();
 
     void push(TaskNode* task);
     TaskNode* pop();
     void push_list(TaskNode* first, TaskNode* last);
+    size_t approximate_size() const;
 
 private:
     struct Node {
@@ -48,21 +66,23 @@ private:
         explicit Node(TaskNode* t) : task(t) {}
     };
 
-    std::mutex mtx_;
+    mutable std::mutex mtx_;
     Node* head_{nullptr};
     Node* tail_{nullptr};
+    size_t size_{0};
 };
 
 class TaskNodePool {
 public:
-    TaskNodePool();
+    TaskNodePool() = default;
     ~TaskNodePool();
 
     TaskNode* acquire();
     void release(TaskNode* n);
+    size_t pool_size() const;
 
 private:
-    std::mutex mtx_;
+    mutable std::mutex mtx_;
     std::vector<TaskNode*> free_list_;
 };
 
@@ -99,12 +119,62 @@ public:
     ~TaskIndex();
 
     void insert(TaskNode* node);
-    TaskNode* find(TaskId id);
+    TaskNode* find(TaskId id) const;
     void remove(TaskId id);
+    size_t count() const;
 
 private:
-    std::mutex mtx_;
+    mutable std::mutex mtx_;
     TaskNode* buckets_[kHashBuckets]{nullptr};
+    size_t count_{0};
+};
+
+class GroupIndex {
+public:
+    GroupIndex();
+    ~GroupIndex();
+
+    void add(TaskNode* node);
+    void remove(TaskNode* node);
+    size_t cancel_group(GroupId group_id);
+    size_t group_size(GroupId group_id) const;
+    size_t total_groups() const;
+
+private:
+    mutable std::mutex mtx_;
+    std::unordered_map<GroupId, TaskNode*> groups_;
+    std::unordered_map<GroupId, size_t> group_counts_;
+};
+
+struct DelayHistogram {
+    std::vector<int64_t> bounds_us;
+    std::vector<uint64_t> counts;
+
+    DelayHistogram();
+    void record(int64_t delay_us);
+    std::string to_string() const;
+    int64_t p50() const;
+    int64_t p99() const;
+};
+
+struct TimerStats {
+    std::atomic<uint64_t> total_scheduled{0};
+    std::atomic<uint64_t> total_executed{0};
+    std::atomic<uint64_t> total_cancelled{0};
+    std::atomic<uint64_t> cancel_attempts{0};
+    std::atomic<uint64_t> periodic_scheduled{0};
+    std::atomic<uint64_t> periodic_fires{0};
+
+    std::atomic<uint64_t> queue_peak{0};
+    std::atomic<uint64_t> tick_count{0};
+    std::atomic<int64_t> last_tick_sec_tick{0};
+    std::atomic<uint64_t> ticks_per_sec{0};
+
+    DelayHistogram delay_hist;
+
+    std::string to_string() const;
+    void record_tick();
+    void update_queue_peak(size_t sz);
 };
 
 class HierarchicalTimeWheel {
@@ -117,10 +187,24 @@ public:
 
     TaskId schedule(Callback cb, Millis delay);
     TaskId schedule_at(Callback cb, TimePoint when);
+    TaskId schedule_periodic(Callback cb, Millis interval);
+    TaskId schedule_group(Callback cb, Millis delay, GroupId group);
+    TaskId schedule_periodic_group(Callback cb, Millis interval, GroupId group);
+
     bool cancel(TaskId id);
+    size_t cancel_group(GroupId group_id);
+
     void shutdown();
     size_t pending_count() const;
     uint64_t current_tick() const;
+
+    const TimerStats& stats() const;
+    std::string stats_report() const;
+    void save_stats_report(const std::string& path) const;
+
+    bool task_exists(TaskId id) const;
+    size_t group_size(GroupId group_id) const;
+    size_t total_groups() const;
 
 private:
     struct Wheel {
@@ -142,6 +226,8 @@ private:
     void add_to_bucket(Wheel& w, int idx, TaskNode* node);
     TaskNode* take_bucket(Wheel& w, int idx);
     void release_bucket(TaskNode* head);
+    TaskId schedule_internal(Callback cb, Millis delay, Millis repeat_ms, GroupId group);
+    void handle_executed_task(TaskNode* node);
 
     Wheel wheel0_{kWheel0Size};
     Wheel wheel1_{kWheel1Size};
@@ -157,14 +243,17 @@ private:
 
     TimePoint start_time_;
 
-    LockFreeQueue ready_queue_;
+    ThreadSafeQueue ready_queue_;
     TaskNodePool pool_;
     TaskIndex task_index_;
+    GroupIndex group_index_;
+    mutable TimerStats stats_;
 
     std::thread tick_thread_;
     std::vector<std::thread> workers_;
 
     mutable std::mutex insert_mtx_;
+    std::mutex stats_mtx_;
 };
 
 class Timer {
@@ -183,8 +272,24 @@ public:
         return impl_->schedule_at(std::move(cb), when);
     }
 
+    TaskId schedule_periodic(Callback cb, Millis interval) {
+        return impl_->schedule_periodic(std::move(cb), interval);
+    }
+
+    TaskId schedule_group(Callback cb, Millis delay, GroupId group) {
+        return impl_->schedule_group(std::move(cb), delay, group);
+    }
+
+    TaskId schedule_periodic_group(Callback cb, Millis interval, GroupId group) {
+        return impl_->schedule_periodic_group(std::move(cb), interval, group);
+    }
+
     bool cancel(TaskId id) {
         return impl_->cancel(id);
+    }
+
+    size_t cancel_group(GroupId group_id) {
+        return impl_->cancel_group(group_id);
     }
 
     size_t pending_count() const {
@@ -193,6 +298,26 @@ public:
 
     void shutdown() {
         impl_->shutdown();
+    }
+
+    const TimerStats& stats() const {
+        return impl_->stats();
+    }
+
+    std::string stats_report() const {
+        return impl_->stats_report();
+    }
+
+    void save_stats_report(const std::string& path) const {
+        impl_->save_stats_report(path);
+    }
+
+    size_t group_size(GroupId group_id) const {
+        return impl_->group_size(group_id);
+    }
+
+    size_t total_groups() const {
+        return impl_->total_groups();
     }
 
 private:
